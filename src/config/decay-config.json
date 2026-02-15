@@ -1,0 +1,16 @@
+{
+  "version": "1.0",
+  "lambda": 0.03,
+  "halfLifeDays": 23,
+  "pruneThreshold": 0.1,
+  "archiveThreshold": 0.2,
+  "warningThreshold": 0.3,
+  "salienceFloor": {
+    "critical": 0.5,
+    "high": 0.3,
+    "medium": 0.1,
+    "low": 0.0
+  },
+  "accessBoostFactor": 0.1,
+  "maxAccessBonus": 0.3
+}
