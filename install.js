@@ -66,6 +66,14 @@ function getMemoryHooks() {
       }],
       description: 'Load relevant memories, check prospective triggers, run decay'
     },
+    PreCompact: {
+      matcher: '*',
+      hooks: [{
+        type: 'command',
+        command: `node "${scriptsDir}/memory-pre-compact.js"`
+      }],
+      description: 'Build memory-aware recovery snapshot before context compaction'
+    },
     Stop: {
       matcher: '*',
       hooks: [{
@@ -139,6 +147,10 @@ function install() {
     path.join(SRC_DIR, 'hooks', 'memory-access-tracker.js'),
     path.join(CLAUDE_DIR, 'scripts', 'hooks', 'memory-access-tracker.js')
   );
+  copyFile(
+    path.join(SRC_DIR, 'hooks', 'memory-pre-compact.js'),
+    path.join(CLAUDE_DIR, 'scripts', 'hooks', 'memory-pre-compact.js')
+  );
 
   // 3. Slash command
   console.log('\nStep 3: Slash command');
@@ -154,6 +166,7 @@ function install() {
   ensureDir(path.join(memDir, 'semantic'));
   ensureDir(path.join(memDir, 'episodes'));
   ensureDir(path.join(memDir, 'consolidation'));
+  ensureDir(path.join(memDir, 'sessions'));
 
   // Decay config (don't overwrite — user may have tuned it)
   copyFile(

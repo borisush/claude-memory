@@ -85,8 +85,23 @@ Read and display:
 ### If `$ARGUMENTS` starts with "search":
 
 Extract the search query from `$ARGUMENTS` (everything after "search").
-Read all semantic JSON files and search entries by content and tags.
-Display matching entries with their salience, decay score, and domain.
+
+**Scored search**: Use `scoredSearch(entries, query)` from `~/.claude/scripts/lib/memory.js` for BM25-inspired ranked results. Search across ALL domains (load each semantic JSON file, combine entries, then search).
+
+Also search **session fingerprints** using `searchSessionFingerprints(query)` from the same library. These are lightweight records of past sessions stored in `~/.claude/memory/sessions/`.
+
+Display results in two sections:
+
+**Memory Matches** (from semantic entries):
+```
+1. [score: 4.2] (cyrano, salience: 0.95) — NEVER use flutter install...
+2. [score: 2.1] (global, salience: 0.5) — Must Read a file before Write/Edit...
+```
+
+**Session Matches** (from session fingerprints):
+```
+- Session 2026-02-15 (cyrano): matched keyword "flutter", files: lib/main.dart
+```
 
 ### If `$ARGUMENTS` starts with "add":
 
