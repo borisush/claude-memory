@@ -12,6 +12,7 @@ const path = require('path');
 const fs = require('fs');
 const os = require('os');
 const { ensureDir, readFile, getDateTimeString, getProjectName, getGitRepoName } = require('./utils');
+const { embedText, cosineSim, encodeEmbedding, decodeEmbedding } = require('./memory-dense');
 
 // ─── Directory Paths ─────────────────────────────────────────
 
@@ -555,8 +556,8 @@ function tokenize(text) {
  * BM25-inspired scored search across memory entries.
  *
  * Scores each entry by:
- *   1. Term frequency x inverse document frequency (content field)
- *   2. Exact tag matches (2x boost)
+ *   1. Term frequency × inverse document frequency (content field)
+ *   2. Exact tag matches (2× boost)
  *   3. Metadata boost: salience and decay score
  *
  * @param {object[]} entries - semantic memory entries
@@ -616,7 +617,7 @@ function scoredSearch(entries, query, options = {}) {
       }
     }
 
-    // Tag score: exact matches get a 2x boost
+    // Tag score: exact matches get a 2× boost
     let tagScore = 0;
     for (const token of queryTokens) {
       if (tagTokens.some(t => t === token || t.includes(token))) {
@@ -663,6 +664,280 @@ function scoredSearch(entries, query, options = {}) {
 function searchEntries(entries, query) {
   const results = scoredSearch(entries, query, { maxResults: 100, minScore: 0.001 });
   return results.map(r => r.entry);
+}
+
+// ─── Hot/Cold Storage Split ─────────────────────────────────
+//
+// Memory entries follow the OMNI-SimpleMem MAU pattern:
+//   HOT  : summary (≤ SUMMARY_MAX chars), tags, salience, embedding, bodyRef
+//   COLD : full body in semantic/raw/<domain>/<id>.md, loaded lazily
+//
+// Backward compat: legacy entries with `content` instead of `summary` are
+// migrated on first read via migrateEntryHotCold().
+
+const SUMMARY_MAX = 280;
+
+function getColdDir() {
+  return path.join(getMemoryDir(), 'semantic', 'raw');
+}
+
+function getColdPath(domain, entryId) {
+  return path.join(getColdDir(), domain, `${entryId}.md`);
+}
+
+/**
+ * Read raw cold-storage content for an entry. Returns null if absent.
+ */
+function loadColdContent(domain, entryId) {
+  const p = getColdPath(domain, entryId);
+  if (!fs.existsSync(p)) return null;
+  try {
+    return fs.readFileSync(p, 'utf8');
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Write raw body to cold storage. Creates the per-domain dir if needed.
+ */
+function writeColdContent(domain, entryId, body) {
+  const dir = path.join(getColdDir(), domain);
+  ensureDir(dir);
+  const p = path.join(dir, `${entryId}.md`);
+  fs.writeFileSync(p, body, 'utf8');
+}
+
+/**
+ * Get the "summary" of an entry, tolerating both new and legacy schema.
+ */
+function getEntrySummary(entry) {
+  return entry.summary || entry.content || '';
+}
+
+/**
+ * Get the full body of an entry. Loads from cold storage if bodyRef is set,
+ * otherwise returns the summary. Used by L2 of pyramid retrieval.
+ */
+function getEntryBody(entry, domain) {
+  if (entry.bodyRef && domain) {
+    const cold = loadColdContent(domain, entry.id);
+    if (cold) return cold;
+  }
+  return getEntrySummary(entry);
+}
+
+/**
+ * Migrate a single entry from legacy {content} to {summary, bodyRef, embedding}.
+ * Returns true if the entry was mutated.
+ *
+ * Migration rules:
+ *   - If content ≤ SUMMARY_MAX: summary = content (no cold body)
+ *   - If content > SUMMARY_MAX: split at first sentence boundary near 280;
+ *     summary = head, full content goes to cold storage, bodyRef set
+ *   - Embedding always recomputed if missing
+ */
+function migrateEntryHotCold(entry, domain) {
+  let mutated = false;
+
+  // Step 1: split content into hot summary + optional cold body
+  if (!entry.summary && entry.content) {
+    const full = entry.content;
+    if (full.length <= SUMMARY_MAX) {
+      entry.summary = full;
+    } else {
+      // Find a sentence boundary in [120, SUMMARY_MAX] range
+      let cut = SUMMARY_MAX;
+      const sentenceEnd = full.slice(0, SUMMARY_MAX).lastIndexOf('. ');
+      if (sentenceEnd >= 120) cut = sentenceEnd + 1;
+      entry.summary = full.slice(0, cut).trim();
+      writeColdContent(domain, entry.id, full);
+      entry.bodyRef = `raw/${domain}/${entry.id}.md`;
+    }
+    delete entry.content;
+    mutated = true;
+  }
+
+  // Step 2: compute embedding if missing
+  if (!entry.embedding) {
+    const summary = entry.summary || '';
+    const tags = (entry.tags || []).join(' ');
+    const body = entry.bodyRef ? (loadColdContent(domain, entry.id) || '') : '';
+    // Embed summary + tags + body so cold-storage content is searchable too
+    const source = `${summary} ${tags} ${body}`.trim();
+    const vec = embedText(source);
+    entry.embedding = encodeEmbedding(vec);
+    mutated = true;
+  }
+
+  return mutated;
+}
+
+/**
+ * Migrate all entries in a domain. Writes back if any mutated.
+ * @returns {number} count of mutated entries
+ */
+function migrateDomain(domain) {
+  const data = readSemanticMemory(domain);
+  if (!data || !data.entries) return 0;
+  let count = 0;
+  for (const entry of data.entries) {
+    if (migrateEntryHotCold(entry, domain)) count++;
+  }
+  if (count > 0) writeSemanticMemory(domain, data);
+  return count;
+}
+
+// ─── Hybrid Dense + Sparse Search (Set-Union Merge) ─────────
+//
+// Per OMNI-SimpleMem §3.2.2: dense and sparse results are merged via
+// set-union, NOT score-based reranking. Score-rerank disrupts semantic
+// ordering and degrades quality. Dense retains its ranking; sparse-only
+// results are appended at the end.
+
+/**
+ * Hybrid search: dense (hashed n-gram cosine) ∪ sparse (BM25).
+ *
+ * @param {object[]} entries - semantic memory entries with embeddings
+ * @param {string} query
+ * @param {object} [options]
+ * @param {number} [options.topK=20]
+ * @param {number} [options.denseFloor=0.05] - min cosine sim for dense candidates
+ * @returns {Array<{entry, score, source}>} merged candidates
+ */
+function hybridSearch(entries, query, options = {}) {
+  const { topK = 20, denseFloor = 0.05 } = options;
+
+  // Sparse arm: existing BM25-inspired scorer
+  const sparseResults = scoredSearch(entries, query, {
+    maxResults: topK * 2,
+    minScore: 0.001,
+  });
+
+  // Dense arm: cosine sim of query embedding against entry embeddings
+  const qVec = embedText(query);
+  const denseResults = [];
+  for (const entry of entries) {
+    if (!entry.embedding) continue;
+    const vec = decodeEmbedding(entry.embedding);
+    if (!vec) continue;
+    const sim = cosineSim(qVec, vec);
+    if (sim >= denseFloor) {
+      denseResults.push({ entry, score: sim });
+    }
+  }
+  denseResults.sort((a, b) => b.score - a.score);
+  const denseTop = denseResults.slice(0, topK);
+
+  // Set-union merge: dense ordering preserved, sparse-only appended
+  const seen = new Set(denseTop.map(r => r.entry.id));
+  const sparseOnly = sparseResults.filter(r => !seen.has(r.entry.id));
+
+  return [
+    ...denseTop.map(r => ({ entry: r.entry, score: r.score, source: 'dense' })),
+    ...sparseOnly.map(r => ({ entry: r.entry, score: r.score, source: 'sparse' })),
+  ].slice(0, topK);
+}
+
+// ─── Pyramid Retrieval (Three-Level Expansion) ──────────────
+//
+// Per OMNI-SimpleMem §3.2.2:
+//   L1: summaries for top-K candidates (always loaded, cheap)
+//   L2: full body from cold storage for high-confidence candidates
+//   L3: raw multimedia (images/audio) — N/A for text-only memory
+// All transitions gated by an explicit token budget.
+
+const TOKEN_PER_CHAR = 0.25; // rough estimate, ~4 chars/token
+
+function estimateTokens(s) {
+  return Math.ceil((s || '').length * TOKEN_PER_CHAR);
+}
+
+/**
+ * Default expansion decision (Hybrid strategy, user-chosen 2026-04-07):
+ *   Expand to L2 if EITHER
+ *     (a) normalized score is at/above the relative threshold, OR
+ *     (b) it's a dense match AND the entry is critical (salience ≥ 0.8)
+ *
+ * Rationale: (a) handles obvious top hits regardless of source; (b) is the
+ * "belt + suspenders" — when dense fires on a critical memory we always
+ * pull its full body even if a noisier sparse hit happens to outrank it.
+ * Sparse-only matches must clear the relative threshold on their own.
+ */
+function defaultShouldExpandToL2(candidate, ctx) {
+  if (ctx.normScore >= ctx.expandThreshold) return true;
+  const sal = (candidate.entry && candidate.entry.salience) || 0;
+  if (candidate.source === 'dense' && sal >= 0.8) return true;
+  return false;
+}
+
+/**
+ * Pyramid retrieval over hybrid search results.
+ *
+ * @param {object[]} entries
+ * @param {string} query
+ * @param {object} [options]
+ * @param {string} [options.domain] - required to load cold bodies
+ * @param {number} [options.topK=20]
+ * @param {number} [options.expandThreshold=0.4] - relative score threshold for L2
+ * @param {number} [options.tokenBudget=6000]
+ * @param {function} [options.shouldExpandToL2] - custom expansion decision hook
+ * @returns {{level1, level2, tokensUsed, budget, candidates}}
+ */
+function pyramidRetrieve(entries, query, options = {}) {
+  const {
+    domain = null,
+    topK = 20,
+    expandThreshold = 0.4,
+    tokenBudget = 6000,
+    shouldExpandToL2 = defaultShouldExpandToL2,
+  } = options;
+
+  const candidates = hybridSearch(entries, query, { topK });
+  if (candidates.length === 0) {
+    return { level1: [], level2: [], tokensUsed: 0, budget: tokenBudget, candidates: [] };
+  }
+
+  // Normalize scores so cross-source comparison is meaningful
+  const maxScore = Math.max(...candidates.map(c => c.score));
+
+  // L1: every candidate contributes its summary
+  let tokensUsed = 0;
+  const level1 = candidates.map(c => {
+    const summary = getEntrySummary(c.entry);
+    const t = estimateTokens(summary);
+    tokensUsed += t;
+    return { ...c, level: 1, text: summary, tokens: t };
+  });
+
+  // L2: expand candidates whose body is in cold storage AND meet expansion criteria.
+  // Each entry may carry its own _domain (set by callers that aggregate across
+  // domains); fall back to the options.domain otherwise.
+  const level2 = [];
+  for (const c of candidates) {
+    if (!c.entry.bodyRef) continue;
+    const entryDomain = c.entry._domain || domain;
+    if (!entryDomain) continue;
+
+    const normScore = maxScore > 0 ? c.score / maxScore : 0;
+    const ctx = { normScore, expandThreshold, tokensUsed, tokenBudget };
+    if (!shouldExpandToL2(c, ctx)) continue;
+
+    const body = loadColdContent(entryDomain, c.entry.id);
+    if (!body) continue;
+    const t = estimateTokens(body);
+    if (tokensUsed + t > tokenBudget) break;
+    tokensUsed += t;
+    level2.push({ ...c, level: 2, text: body, tokens: t });
+  }
+
+  return {
+    level1,
+    level2,
+    tokensUsed,
+    budget: tokenBudget,
+    candidates,
+  };
 }
 
 // ─── Session Fingerprinting ─────────────────────────────────
@@ -1022,6 +1297,22 @@ module.exports = {
   tokenize,
   scoredSearch,
   searchEntries,
+
+  // Search (v3 — hybrid dense+sparse with set-union, pyramid retrieval)
+  hybridSearch,
+  pyramidRetrieve,
+  defaultShouldExpandToL2,
+  estimateTokens,
+
+  // Hot/cold storage (MAU pattern)
+  getColdDir,
+  getColdPath,
+  loadColdContent,
+  writeColdContent,
+  getEntrySummary,
+  getEntryBody,
+  migrateEntryHotCold,
+  migrateDomain,
 
   // Session fingerprinting
   extractSessionFingerprint,

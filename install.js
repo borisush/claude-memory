@@ -128,29 +128,32 @@ function install() {
       path.join(CLAUDE_DIR, 'scripts', 'lib', 'utils.js')
     );
   }
-  copyFile(
-    path.join(SRC_DIR, 'lib', 'memory.js'),
-    path.join(CLAUDE_DIR, 'scripts', 'lib', 'memory.js')
-  );
+  for (const lib of [
+    'memory.js',
+    'memory-dense.js',
+    'memo-cross.js',
+    'memo-entities.js',
+    'memo-staged.js',
+    'package-manager.js',
+    'session-aliases.js',
+    'session-manager.js',
+  ]) {
+    copyFile(
+      path.join(SRC_DIR, 'lib', lib),
+      path.join(CLAUDE_DIR, 'scripts', 'lib', lib)
+    );
+  }
 
-  // 2. Hook scripts
+  // 2. Hook scripts — copy every .js in src/hooks/
   console.log('\nStep 2: Hook scripts');
-  copyFile(
-    path.join(SRC_DIR, 'hooks', 'memory-session-start.js'),
-    path.join(CLAUDE_DIR, 'scripts', 'hooks', 'memory-session-start.js')
-  );
-  copyFile(
-    path.join(SRC_DIR, 'hooks', 'memory-session-end.js'),
-    path.join(CLAUDE_DIR, 'scripts', 'hooks', 'memory-session-end.js')
-  );
-  copyFile(
-    path.join(SRC_DIR, 'hooks', 'memory-access-tracker.js'),
-    path.join(CLAUDE_DIR, 'scripts', 'hooks', 'memory-access-tracker.js')
-  );
-  copyFile(
-    path.join(SRC_DIR, 'hooks', 'memory-pre-compact.js'),
-    path.join(CLAUDE_DIR, 'scripts', 'hooks', 'memory-pre-compact.js')
-  );
+  const hooksSrcDir = path.join(SRC_DIR, 'hooks');
+  const hooksDestDir = path.join(CLAUDE_DIR, 'scripts', 'hooks');
+  for (const hookFile of fs.readdirSync(hooksSrcDir).filter(f => f.endsWith('.js'))) {
+    copyFile(
+      path.join(hooksSrcDir, hookFile),
+      path.join(hooksDestDir, hookFile)
+    );
+  }
 
   // 3. Slash command
   console.log('\nStep 3: Slash command');

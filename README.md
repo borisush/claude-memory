@@ -50,10 +50,29 @@ node install.js --remove  # Removes hooks only (preserves memory data)
 |---|---|
 | `/memory` or `/memory consolidate` | Distill current session into lasting memory |
 | `/memory status` | Show memory stats, fading entries, active triggers |
-| `/memory search <query>` | Search memories by keyword across all domains |
+| `/memory search <query>` | Hybrid (BM25 + dense) search with pyramid retrieval |
 | `/memory add <content>` | Manually add a semantic memory entry |
 | `/memory forget <id>` | Remove a specific memory entry |
 | `/memory triggers` | List and manage prospective triggers |
+| `/memory cross` | **MeMo-style**: find cross-domain patterns worth promoting to `global` |
+| `/memory entities <query>` | **MeMo-style**: reverse-lookup — which memories mention X? |
+| `/memory entities rebuild` | Rebuild the entity reverse-index (auto-runs at consolidate end) |
+| `/memory ask <question>` | **MeMo-style**: staged retrieval — narrows by entity if ambiguous |
+
+### Command-line tools
+
+The entity-index module is also usable directly from a shell:
+
+```bash
+node ~/.claude/scripts/lib/memo-entities.js rebuild       # full rebuild
+node ~/.claude/scripts/lib/memo-entities.js lookup stripe # query
+node ~/.claude/scripts/lib/memo-entities.js stats         # show index health
+node ~/.claude/scripts/lib/memo-entities.js validate      # parse-check all memory data
+```
+
+The `validate` subcommand catches silent JSON corruption that would otherwise
+hide memories from search (it found and helped repair a 31-entry data-loss
+bug on the author's machine).
 
 ### Automatic Behavior
 
@@ -78,25 +97,76 @@ node install.js --remove  # Removes hooks only (preserves memory data)
 │   └── consolidation/          # Archived entries below prune threshold
 ├── scripts/
 │   ├── lib/
-│   │   ├── memory.js           # Core library (CRUD, decay, triggers, search)
-│   │   └── utils.js            # Minimal utilities (bundled or reuses existing)
+│   │   ├── memory.js           # Core library (CRUD, decay, triggers, hybrid+pyramid search)
+│   │   ├── memory-dense.js     # Hashed n-gram embeddings for dense retrieval
+│   │   ├── memo-cross.js       # Cross-domain pattern finder (MeMo-style)
+│   │   ├── memo-entities.js    # Entity reverse-index + lookup + validate CLI
+│   │   ├── memo-staged.js      # Staged retrieval with ambiguity detection
+│   │   ├── utils.js            # Minimal utilities (bundled or reuses existing)
+│   │   ├── package-manager.js, session-aliases.js, session-manager.js
 │   └── hooks/
-│       ├── memory-session-start.js   # SessionStart hook
-│       ├── memory-session-end.js     # SessionEnd hook
-│       └── memory-access-tracker.js  # Stop hook
+│       ├── memory-session-start.js, memory-session-end.js, memory-access-tracker.js
+│       ├── memory-pre-compact.js, pre-compact.js
+│       ├── session-start.js, session-end.js
+│       └── evaluate-session.js, suggest-compact.js, check-console-log.js
 ├── commands/
-│   └── memory.md               # /memory slash command
+│   └── memory.md               # /memory slash command (10 subcommands)
 └── hooks/
-    └── hooks.json              # Hook registration (3 entries added)
+    └── hooks.json              # Hook registration
 ```
 
+## MeMo-style Enhancements (v1.1)
+
+Inspired by the [MeMo paper](https://arxiv.org/abs/2605.15156) (May 2026),
+which proposes treating memory as a trainable model. This system stays
+symbolic (files, not weights) but borrows three architectural ideas:
+
+**Cross-document synthesis** (`/memory cross`) — scans all project memories
+for patterns recurring across ≥2 domains via tag-set + token-set Jaccard
+clustering. Surfaces candidates for promotion to `global` entries.
+[memo-cross.js](src/lib/memo-cross.js)
+
+**Entity-surfacing reverse index** (`/memory entities <query>`) — 12
+extractors (backticks, paths, URLs, slash commands, services, git SHAs,
+Stripe IDs, device serials, Calendly slugs, filenames, identifiers,
+constants) build a `~/.claude/memory/entity-index.json` reverse lookup.
+Kind-weighted ranking — commands and paths beat noisy identifiers on the
+same match tier. [memo-entities.js](src/lib/memo-entities.js)
+
+**Staged retrieval with ambiguity detection** (`/memory ask <question>`) —
+groups candidates by IDF-distinctive entity, returns either a confident
+answer (one entity group dominates) or surfaces competing groups for a
+disambiguating follow-up question. [memo-staged.js](src/lib/memo-staged.js)
+
+All three are additive — they import from `memory.js` but don't modify it.
+
+## Hybrid + Pyramid Retrieval (v1.1)
+
+`/memory search` is no longer pure BM25. Search now combines:
+
+- **Sparse**: BM25-inspired TF·IDF + tag boosts + phrase bonus
+- **Dense**: Hashed n-gram embeddings, cosine similarity (no external model)
+- **Set-union merge**: Dense ordering preserved, sparse-only appended (no
+  score reranking, which destroys ordering)
+- **Pyramid expansion**: L1 summaries for every candidate; L2 cold-storage
+  bodies for high-confidence hits, all gated by an explicit token budget
+
+Memory entries support a hot/cold split — short `summary` in JSON, full body
+in `semantic/raw/<domain>/<id>.md` loaded lazily. Migration is automatic via
+`migrateEntryHotCold()` on first read of a legacy entry.
+
 ## Semantic Memory Entry Format
+
+Entries use a hot/cold split (MAU schema). Hot fields stay in
+`semantic/<domain>.json`; the optional full body lives at
+`semantic/raw/<domain>/<id>.md`:
 
 ```json
 {
   "id": "sem-myproject-001",
-  "content": "Description of the knowledge",
   "domain": "myproject",
+  "summary": "Lead with the rule/fact in ≤ 280 chars — searchable, hot-loaded",
+  "bodyRef": "raw/myproject/sem-myproject-001.md",
   "tags": ["keyword1", "keyword2"],
   "salience": 0.8,
   "salienceReason": "architecture-decision",
@@ -104,9 +174,14 @@ node install.js --remove  # Removes hooks only (preserves memory data)
   "lastAccessed": "2026-02-10T14:00:00Z",
   "accessCount": 5,
   "decayScore": 0.85,
-  "associations": ["sem-myproject-002"]
+  "associations": ["sem-myproject-002"],
+  "embedding": "<base64-encoded hashed n-gram vector>"
 }
 ```
+
+Legacy entries using `content` instead of `summary` are auto-migrated on
+first read via `migrateEntryHotCold(entry, domain)`. The `embedding` field
+is computed automatically and powers dense retrieval.
 
 ### Salience Scale
 
